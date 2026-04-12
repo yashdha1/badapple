@@ -1,6 +1,7 @@
 """Terminal UI: startup menu and in-player HUD."""
 
 import os
+import re
 import sys
 
 from .ascii import CHARSETS, DETAIL_LEVELS, resolve_detail_label
@@ -70,6 +71,13 @@ THEMES = [
 
 VIDEO_EXTS = {".mp4", ".webm", ".avi", ".mkv", ".mov", ".flv", ".m4v"}
 
+# Strip ANSI SGR sequences for measuring visible width (avoid HUD line wrap).
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def _strip_ansi(s: str) -> str:
+    return _ANSI_RE.sub("", s)
+
 
 def _w(s: str) -> None:
     sys.stdout.write(s)
@@ -134,6 +142,8 @@ def draw_loading(title: str, theme_idx: int = 0) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 VIDEOS_DIR = "videos"
+AUDIO_DIR  = "audio_extracted"
+AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac"}
 
 
 def scan_videos() -> list[str]:
@@ -151,15 +161,36 @@ def video_full_path(filename: str) -> str:
     return os.path.join(VIDEOS_DIR, filename)
 
 
-def draw_menu(videos: list[str], sel: int, theme_idx: int = 0) -> None:
-    theme = _theme(theme_idx)
-    t     = _term()
-    W     = min(t.columns - 4, 62)          # inner box width
-    pad   = " " * max(0, (t.columns - W - 2) // 2)
-    lines = ["\033[H\033[J"]
+def scan_audio() -> list[str]:
+    """Return sorted list of audio filenames inside audio_extracted/."""
+    if not os.path.isdir(AUDIO_DIR):
+        os.makedirs(AUDIO_DIR, exist_ok=True)
+    return sorted(
+        f for f in os.listdir(AUDIO_DIR)
+        if os.path.splitext(f)[1].lower() in AUDIO_EXTS
+    )
+
+
+def audio_full_path(filename: str) -> str:
+    return os.path.join(AUDIO_DIR, filename)
+
+
+def draw_menu(
+    videos: list[str],
+    sel: int,
+    theme_idx: int = 0,
+    tab: int = 0,
+    audio_files: list[str] | None = None,
+) -> None:
+    theme       = _theme(theme_idx)
+    t           = _term()
+    W           = min(t.columns - 4, 62)
+    pad         = " " * max(0, (t.columns - W - 2) // 2)
+    audio_files = audio_files or []
+    lines       = ["\033[H\033[J"]
 
     # ── logo box ──────────────────────────────────────────────────────────────
-    logo = f"  ASCII TERMINAL VIDEO PLAYER  [{theme['name']}]  "
+    logo     = f"  ASCII TERMINAL VIDEO PLAYER  [{theme['name']}]  "
     subtitle = "A terminal cinema for local videos"
     lines += [
         "\n",
@@ -170,22 +201,37 @@ def draw_menu(videos: list[str], sel: int, theme_idx: int = 0) -> None:
         "\n",
     ]
 
-    # ── status strip ─────────────────────────────────────────────────────────
-    stats = f"Library: {len(videos)} videos"
-    actions = "T Theme  |  P Path  |  ENTER Play"
-    lines += [
-        f"{pad}  {theme['muted']}{stats}{RST}  {theme['muted']}|{RST}  {theme['accent']}{actions}{RST}\n"
-    ]
-
-    # ── mode strip ───────────────────────────────────────────────────────────
-    lines += [
-        f"{pad}  {theme['muted']}Modes:{RST}  {_mode_strip('custom', theme)}\n\n"
-    ]
+    # ── tab bar ───────────────────────────────────────────────────────────────
+    tab_videos = (
+        f"{theme['highlight']}{BOLD}[ VIDEOS ]{RST}" if tab == 0
+        else f"{theme['muted']}  VIDEOS  {RST}"
+    )
+    tab_audio = (
+        f"{theme['highlight']}{BOLD}[ AUDIO ]{RST}" if tab == 1
+        else f"{theme['muted']}  AUDIO  {RST}"
+    )
+    lines.append(
+        f"{pad}  {tab_videos}  {tab_audio}  "
+        f"{theme['muted']}(TAB to switch){RST}\n\n"
+    )
 
     # ── file list ─────────────────────────────────────────────────────────────
-    if videos:
-        lines.append(f"{pad}  {theme['muted']}Videos in  {BOLD}{VIDEOS_DIR}/{RST}{theme['muted']}:{RST}\n\n")
-        for i, v in enumerate(videos):
+    if tab == 0:
+        items    = videos
+        src_dir  = VIDEOS_DIR
+        empty_msg = "No video files found in this folder."
+        # Show mode strip only on video tab
+        lines.append(
+            f"{pad}  {theme['muted']}Modes:{RST}  {_mode_strip('custom', theme)}\n\n"
+        )
+    else:
+        items    = audio_files
+        src_dir  = AUDIO_DIR
+        empty_msg = "No audio files found. Use  python main.py -a <url>  to download."
+
+    if items:
+        lines.append(f"{pad}  {theme['muted']}Files in  {BOLD}{src_dir}/{RST}{theme['muted']}:{RST}\n\n")
+        for i, v in enumerate(items):
             label = v if len(v) <= W - 6 else v[: W - 9] + "…"
             if i == sel:
                 bar = f"{theme['highlight']}▶  {label:<{W - 6}}{RST}"
@@ -193,17 +239,19 @@ def draw_menu(videos: list[str], sel: int, theme_idx: int = 0) -> None:
             else:
                 lines.append(f"{pad}    {theme['muted']}·{RST} {theme['text']}{label}{RST}\n")
     else:
-        lines.append(f"{pad}  {theme['muted']}No video files found in this folder.{RST}\n")
+        lines.append(f"{pad}  {theme['muted']}{empty_msg}{RST}\n")
 
     # ── footer ────────────────────────────────────────────────────────────────
     lines += [
         f"\n{pad}  {theme['muted']}{'-' * (W - 2)}{RST}\n",
         f"{pad}  {theme['muted']}UP/DOWN{RST} Navigate  "
         f"{theme['muted']}ENTER{RST} Play  "
-        f"{theme['muted']}P{RST} Custom path  "
+        f"{theme['muted']}TAB{RST} Switch tab  "
         f"{theme['muted']}T{RST} Theme  "
+        f"{theme['muted']}P{RST} Path  "
         f"{theme['muted']}Q{RST} Quit\n",
-        f"{pad}  {theme['muted']}Tip:{RST} Use {theme['highlight']}--add <url>{RST} from CLI to download quickly.\n",
+        f"{pad}  {theme['muted']}Tip:{RST} Use {theme['highlight']}--add <url>{RST} for video  "
+        f"or {theme['highlight']}-a <url>{RST} for audio.\n",
     ]
 
     _w("".join(lines))
@@ -227,9 +275,16 @@ def draw_hud(
     colorized   : bool,
     theme_idx   : int,
     paused      : bool,
+    term_cols   : int | None = None,  # ignored; layout uses live os.get_terminal_size()
 ) -> None:
+    """
+    Draw chrome + video using one cursor move per row. Sequential newlines break
+    layout when any line wraps; explicit \\033[row;1H avoids that.
+    *asc_h* is container_rows (letterboxed block height in lines).
+    """
     theme = _theme(theme_idx)
-    cols = _term().columns
+    # Always use the real buffer width; a cached column count can exceed the window and wrap.
+    cols = max(_term().columns, 20)
 
     # timecodes
     elapsed = frame_num / max(fps, 1)
@@ -238,13 +293,11 @@ def draw_hud(
     tm, ts  = divmod(int(tot_sec), 60)
     tc      = f"{em:02d}:{es:02d} / {tm:02d}:{ts:02d}"
 
-    # play/pause icon
     if paused:
         state_str = f"{theme['warning']}PAUSED{RST}"
     else:
         state_str = f"{theme['success']}PLAYING{RST}"
 
-    # charset label
     cs_name  = CHARSETS[charset_idx][1]
     cs_label = f"{theme['accent']}{cs_name}{RST}{theme['muted']}({charset_idx + 1}/{len(CHARSETS)}){RST}"
     detail_name = resolve_detail_label(detail_idx, auto_detail)
@@ -253,53 +306,158 @@ def draw_hud(
     color_label = f"{theme['accent']}COLOR{RST}" if colorized else f"{theme['muted']}B/W{RST}"
     mode_label = f"{theme['accent']}ASCII CINEMA{RST}"
 
-    # dynamic progress bar fills remaining terminal width
-    fixed    = 2 + 10 + 2 + 2 + len(tc) + 2   # state(10) + brackets + time
+    fixed    = 2 + 10 + 2 + 2 + len(tc) + 2
     bar_w    = max(8, cols - fixed - 2)
     filled   = int((frame_num / max(total, 1)) * bar_w)
     bar      = f"{theme['accent']}{'=' * filled}{theme['muted']}{'-' * (bar_w - filled)}{RST}"
 
-    # title truncated to fit
-    max_t   = cols - len(cs_name) - 20
-    t_label = title if len(title) <= max_t else title[: max_t - 1] + "…"
+    t_label = title
+    line2 = (
+        f"{BOLD}{t_label}{RST}  {theme['muted']}|{RST}  {mode_label}  "
+        f"{theme['muted']}|{RST}  {cs_label}  "
+        f"{theme['muted']}|{RST}  {detail_label}  "
+        f"{theme['muted']}|{RST}  {color_label}  "
+        f"{theme['muted']}|{RST}  {theme_label}  "
+        f"{theme['muted']}|{RST}  {theme['muted']}{fps:.0f} fps{RST}"
+    )
+    while len(_strip_ansi(line2)) > cols and len(t_label) > 12:
+        t_label = t_label[:-2] + "…"
+        line2 = (
+            f"{BOLD}{t_label}{RST}  {theme['muted']}|{RST}  {mode_label}  "
+            f"{theme['muted']}|{RST}  {cs_label}  "
+            f"{theme['muted']}|{RST}  {detail_label}  "
+            f"{theme['muted']}|{RST}  {color_label}  "
+            f"{theme['muted']}|{RST}  {theme_label}  "
+            f"{theme['muted']}|{RST}  {theme['muted']}{fps:.0f} fps{RST}"
+        )
 
     hints = (
         f"{theme['muted']}SPACE/P{RST} pause  "
+        f"MODE {_mode_strip(mode_name, theme)}  "
         f"{theme['muted']}V{RST} charset  "
         f"{theme['muted']}M{RST} detail  "
         f"{theme['muted']}A{RST} auto  "
         f"{theme['muted']}C{RST} color  "
         f"{theme['muted']}T{RST} theme  "
-        f"{theme['muted']}F{RST} fullscreen  "
+        f"{theme['muted']}F{RST} fs  "
         f"{theme['muted']}H{RST} hud  "
         f"{theme['muted']}Q/ESC{RST} quit"
     )
+    if len(_strip_ansi(hints)) > cols:
+        hints_one = f"{theme['muted']}SPACE/P pause  MODE 1·2·3  Q quit{RST}"
+    else:
+        hints_one = hints
 
-    buf = [
-        f"\033[H\033[2K {theme['muted']}{'=' * max(cols - 2, 10)}{RST}\n",
-        # row 2: title bar
-        "\033[2K",
-        f" {BOLD}{t_label}{RST}  {theme['muted']}|{RST}  {mode_label}  "
-        f"{theme['muted']}|{RST}  {cs_label}  "
-        f"{theme['muted']}|{RST}  {detail_label}  "
-        f"{theme['muted']}|{RST}  {color_label}  "
-        f"{theme['muted']}|{RST}  {theme_label}  "
-        f"{theme['muted']}|{RST}  {theme['muted']}{fps:.0f} fps{RST}\n",
-        # row 3: dedicated mode strip
-        f"\033[2K  {_mode_strip(mode_name, theme)}\n",
-        # rows 4 … asc_h+3: ascii frame
-        ascii_frame,
-        # row asc_h+4: progress bar
-        f"\033[{asc_h + 4};1H\033[2K  {state_str}  [{bar}]  {BOLD}{tc}{RST}",
-        # row asc_h+5: hints
-        f"\033[{asc_h + 5};1H\033[2K  {hints}",
+    ascii_lines = ascii_frame.split("\n")
+    # Rows 1–2: chrome. Rows 3..2+len: video block. Progress/hints follow immediately after.
+    progress_row = 3 + len(ascii_lines)
+
+    parts: list[str] = [
+        f"\033[1;1H\033[2K{theme['muted']}{'=' * cols}{RST}",
+        f"\033[2;1H\033[2K{line2}",
     ]
+    for i, aline in enumerate(ascii_lines):
+        parts.append(f"\033[{3 + i};1H\033[2K{aline}")
+    parts.append(f"\033[{progress_row};1H\033[2K{state_str}  [{bar}]  {BOLD}{tc}{RST}")
+    parts.append(f"\033[{progress_row + 1};1H\033[2K{hints_one}")
 
-    sys.stdout.write("".join(buf))
+    sys.stdout.write("".join(parts))
     sys.stdout.flush()
 
 
 def draw_video_only(ascii_frame: str) -> None:
     """Draw only video content for a full-screen-like terminal experience."""
     sys.stdout.write("\033[H" + ascii_frame)
+    sys.stdout.flush()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AUDIO PLAYER
+# ══════════════════════════════════════════════════════════════════════════════
+
+_BAR_CHARS = " ▁▂▃▄▅▆▇█"
+
+
+def make_audio_art(cols: int, rows: int, heights: list[float], theme_idx: int) -> str:
+    """Render a spectrum-analyser bar chart. heights[i] is 0..1 per column."""
+    theme = _theme(theme_idx)
+    n     = len(heights)
+    lines = []
+    for r in range(rows):
+        full_thresh = (rows - r) / rows
+        part_thresh = full_thresh - 1 / rows
+        line        = ""
+        prev_color  = ""
+        for col in range(cols):
+            h = heights[col * n // cols] if n else 0.0
+            if h >= full_thresh:
+                color = theme["accent"]
+                ch    = "█"
+            elif h >= part_thresh:
+                frac  = (h - part_thresh) * rows
+                idx   = max(1, min(8, int(frac * 8) + 1))
+                ch    = _BAR_CHARS[idx]
+                color = theme["frame"]
+            else:
+                color = ""
+                ch    = " "
+            if color != prev_color:
+                if prev_color:
+                    line += RST
+                if color:
+                    line += color
+                prev_color = color
+            line += ch
+        if prev_color:
+            line += RST
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def draw_audio_hud(
+    art      : str,
+    elapsed  : float,
+    total    : float,
+    title    : str,
+    paused   : bool,
+    theme_idx: int,
+    art_rows : int,
+) -> None:
+    theme = _theme(theme_idx)
+    cols  = _term().columns
+
+    em, es = divmod(int(elapsed), 60)
+    tm, ts = divmod(int(max(total, elapsed)), 60)
+    tc     = f"{em:02d}:{es:02d} / {tm:02d}:{ts:02d}"
+
+    state_str   = f"{theme['warning']}PAUSED{RST}" if paused else f"{theme['success']}PLAYING{RST}"
+    theme_label = f"{theme['frame']}{THEMES[theme_idx % len(THEMES)]['name']}{RST}"
+
+    fixed  = 2 + 10 + 2 + 2 + len(tc) + 2
+    bar_w  = max(8, cols - fixed - 2)
+    ratio  = (elapsed / total) if total > 0 else 0.0
+    filled = int(ratio * bar_w)
+    bar    = f"{theme['accent']}{'=' * filled}{theme['muted']}{'-' * (bar_w - filled)}{RST}"
+
+    max_t   = cols - 24
+    t_label = title if len(title) <= max_t else title[: max_t - 1] + "…"
+
+    hints = (
+        f"{theme['muted']}SPACE/P{RST} pause  "
+        f"{theme['muted']}T{RST} theme  "
+        f"{theme['muted']}Q/ESC{RST} quit"
+    )
+
+    buf = [
+        f"\033[H\033[2K {theme['muted']}{'═' * max(cols - 2, 10)}{RST}\n",
+        f"\033[2K {BOLD}{t_label}{RST}  "
+        f"{theme['muted']}|{RST}  {theme['accent']}♫ AUDIO{RST}  "
+        f"{theme['muted']}|{RST}  {theme_label}\n",
+        "\033[2K\n",                              # blank spacer row
+        art,                                      # rows 4 … 3+art_rows
+        f"\033[{art_rows + 4};1H\033[2K  {state_str}  [{bar}]  {BOLD}{tc}{RST}",
+        f"\033[{art_rows + 5};1H\033[2K  {hints}",
+    ]
+
+    sys.stdout.write("".join(buf))
     sys.stdout.flush()

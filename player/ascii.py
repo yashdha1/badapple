@@ -3,6 +3,12 @@
 import cv2
 import numpy as np
 
+# Prefer Lanczos for upscales when available (OpenCV 4+).
+_UP = getattr(cv2, "INTER_LANCZOS4", cv2.INTER_CUBIC)
+
+# Upper bound for ultra horizontal resolution (terminal cols cap the real size).
+ULTRA_MAX_WIDTH: int = 1600
+
 CHARSETS: list[tuple[str, str]] = [
     (" .'`^\",;Il!i><~+_-?][}{1)(|/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$", "Detailed"),
     (" .,:;i1tfLCG08@",                                                          "Simple"),
@@ -39,6 +45,40 @@ CHARSETS: list[tuple[str, str]] = [
     (" ⡀⡄⡆⡇⣇⣧⣷⣿",                                         "Braille Sweep"), # Left-to-right sweep, very cinematic
     (" ▴▵△▲",                                               "Triangle"),     # For crystalline/geometric scenes
     (" ,;:<>[]|Il!1i",                                       "Thin Noise"),   # Dense, fine-grained noise/static
+    # --- Corner & Edge Emphasis ---
+    (" ┘┐┌└┼─│╴╵╶╷",                           "Corner Sharp"),   # Hard 90° corners, grid feel
+    (" ╰╯╮╭│─",                                 "Corner Round"),   # Rounded corners, softer flow
+    (" ┛┓┏┗╋━┃",                                "Corner Bold"),    # Thick corners, strong structure
+    (" ╝╗╔╚╬═║",                                "Corner Double"),  # Double-line corners, ornate
+    (" ▗▖▝▘",                                   "Corner Quad"),    # Quarter-block corners only
+
+    # --- Directional / Flow ---
+    (" ←↑→↓↖↗↘↙",                              "Arrow Flow"),     # Directional energy map
+    (" ⇐⇑⇒⇓⇔⇕",                               "Arrow Bold"),     # Bold arrows, strong motion
+    (" ▹▸◂◃△▽",                                 "Chevron"),        # Arrowhead shapes, fast feel
+    (" ╱╲╳",                                    "Diagonal"),       # Diagonal cuts, slash effects
+    (" ⟋⟍⟆⟇",                                  "Slash"),          # Stylized diagonals
+
+    # --- Frame / Structure Highlight ---
+    (" ▕▏▔▁",                                   "Edge Thin"),      # Thin single-side edges
+    (" ▐▌▀▄",                                   "Edge Half"),      # Half-block edges — sharp borders
+    (" ┄┆┈┊",                                   "Dashed"),         # Dashed structure, scanning effect
+    (" ╒╓╕╖╙╜╛╞╟╡╢╤╥╧╨╪╫",                     "Mixed Box"),      # Mixed single/double box draw
+    (" ▉▊▋▌▍▎▏",                               "Left Fade"),      # Fade from left wall outward
+
+    # --- Particle / Spark ---
+    (" ·✦✺❋❊❉❈",                               "Spark"),          # Expanding spark burst
+    (" ˖ ˙ ⁺ ∘ ⊹ ✦ ✧",                        "Glimmer"),        # Subtle light glimmer
+    (" ⁘⁙⁚⁛",                                  "Dot Matrix"),     # Arranged dot patterns
+    (" ⋰⋱⋮⋯",                                  "Ellipsis"),       # Trailing motion dots
+    (" ∴∵∶∷",                                   "Reason"),         # Dense logical dot clusters
+
+    # --- Organic / Fluid ---
+    (" ꩜ ꩝ 〇 ◌ ◍ ◎ ● ◉",                     "Ripple"),         # Expanding rings, sonar/water
+    (" ╭─╮│ │╰─╯",                             "Bubble Box"),     # Rounded box outline pieces
+    (" ⌁⌂⌃⌄⌅⌆",                               "Tech"),           # Technical symbol feel
+    (" ≀⋮⋯⋰⋱",                                 "Scatter"),        # Scattered asymmetric dots
+    (" ⠶⠦⠧⠷⠿⣿",                               "Braille Corner"), # Braille with corner-heavy patterns
 ]
 
 DETAIL_LEVELS: list[dict[str, float | str]] = [
@@ -58,6 +98,27 @@ CHAR_ASPECT: float = 0.5
 _DEFAULT_HUD_ROWS = 4
 
 
+# ── ANSI 256-colour helpers ───────────────────────────────────────────────────
+
+def _c6(v: np.ndarray) -> np.ndarray:
+    """Vectorised: map each 0-255 value to a 0-5 ANSI-256 colour-cube index."""
+    return np.clip(np.where(v < 48, 0, np.where(v < 115, 1, (v.astype(np.int32) - 35) // 40)), 0, 5).astype(np.uint8)
+
+
+def _compute_color_codes(color_frame: np.ndarray) -> np.ndarray:
+    """Return a (H, W) uint8 array of ANSI-256 colour indices for BGR color_frame."""
+    r = color_frame[:, :, 2]
+    g = color_frame[:, :, 1]
+    b = color_frame[:, :, 0]
+    return (16 + 36 * _c6(r) + 6 * _c6(g) + _c6(b)).astype(np.uint8)
+
+
+def _gamma_u8(gray: np.ndarray, gamma: float = 2.2) -> np.ndarray:
+    """Perceptual gamma for luminance before mapping to charset indices."""
+    x = gray.astype(np.float32) / 255.0
+    return np.clip(np.power(np.maximum(x, 1e-6), 1.0 / gamma) * 255.0, 0, 255).astype(np.uint8)
+
+
 def compute_canvas(
     vid_w: int,
     vid_h: int,
@@ -65,6 +126,7 @@ def compute_canvas(
     term_rows: int,
     hud_rows: int = _DEFAULT_HUD_ROWS,
     keep_cinematic_16_9: bool = True,
+    max_width: int | None = None,
 ) -> tuple[int, int, int, int, int]:
     """
     Compute ASCII canvas dimensions that:
@@ -103,9 +165,18 @@ def compute_canvas(
         asc_h = container_rows
         asc_w = int(asc_h * vid_ar / CHAR_ASPECT)
 
-    # ── centering offsets ─────────────────────────────────────────────────────
-    pad_top  = (container_rows - asc_h) // 2
-    pad_left = (container_cols - asc_w) // 2
+    # ── ultra-mode pixel cap (480p-class horizontal detail) ───────────────────
+    if max_width is not None and asc_w > max_width:
+        asc_w = max_width
+        asc_h = int(asc_w * CHAR_ASPECT / vid_ar)
+        if asc_h > container_rows:
+            asc_h = container_rows
+            asc_w = int(asc_h * vid_ar / CHAR_ASPECT)
+
+    # Vertical: center inside the 16:9 container; horizontal: center in full terminal
+    # width so the image stays centered when container_cols < avail_cols (short windows).
+    pad_top = (container_rows - asc_h) // 2
+    pad_left = max(0, (avail_cols - asc_w) // 2)
 
     return asc_w, asc_h, pad_top, pad_left, container_rows
 
@@ -195,8 +266,56 @@ def _apply_profile(gray: np.ndarray, profile: dict[str, float | str]) -> np.ndar
     return enhanced
 
 
-def _render_rows(sampled: np.ndarray, chars: str, color_ramp: list[str] | None) -> str:
+def _render_rows_ultra_rle(
+    sampled: np.ndarray,
+    chars: str,
+    color_codes: np.ndarray,
+) -> str:
+    """ANSI-256 ultra path: run-length encode identical (color, glyph) spans per row."""
     n = len(chars) - 1
+    h, w = int(sampled.shape[0]), int(sampled.shape[1])
+    rows: list[str] = []
+    for row_idx in range(h):
+        line = sampled[row_idx]
+        code_row = color_codes[row_idx]
+        ch_idx = np.clip(line.astype(np.int32) * n // 255, 0, n)
+        keys = code_row.astype(np.uint32) * 256 + ch_idx.astype(np.uint32)
+        if w == 0:
+            rows.append("\033[0m")
+            continue
+        change = np.empty(w, dtype=bool)
+        change[0] = True
+        if w > 1:
+            change[1:] = keys[1:] != keys[:-1]
+        starts = np.flatnonzero(change)
+        ends = np.r_[starts[1:], w]
+        parts: list[str] = []
+        active_code = -1
+        for si, ei in zip(starts, ends):
+            key = int(keys[si])
+            code = key // 256
+            chi = min(key % 256, n)
+            if code != active_code:
+                parts.append(f"\033[38;5;{code}m")
+                active_code = code
+            cch = chars[chi]
+            run = ei - si
+            parts.append(cch if run == 1 else cch * run)
+        parts.append("\033[0m")
+        rows.append("".join(parts))
+    return "\n".join(rows)
+
+
+def _render_rows(
+    sampled   : np.ndarray,
+    chars     : str,
+    color_ramp: list[str] | None,
+    color_codes: np.ndarray | None = None,   # (H,W) uint8 ANSI-256 indices
+) -> str:
+    n = len(chars) - 1
+    if color_codes is not None:
+        return _render_rows_ultra_rle(sampled, chars, color_codes)
+
     rows: list[str] = []
 
     for line in sampled:
@@ -226,17 +345,44 @@ def frame_to_ascii(
     detail_idx: int = 0,
     auto_detail: bool = False,
     color_ramp: list[str] | None = None,
+    color_frame=None,     # original BGR ndarray → triggers per-pixel ANSI-256 color
 ) -> str:
     chars = CHARSETS[charset_idx][0]
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     profile = _detail_profile(gray, detail_idx, auto_detail)
+    # Ultra (color_frame): gentler local contrast / edges so ANSI color + gamma carry the look.
+    if color_frame is not None:
+        profile = dict(profile)
+        profile["clahe"] = float(profile["clahe"]) * 0.88
+        profile["sharpen"] = float(profile["sharpen"]) * 0.82
+        profile["edges"] = float(profile["edges"]) * 0.75
     gray = _apply_profile(gray, profile)
 
     scale = float(profile["scale"])
+    if color_frame is not None:
+        # Slightly lower supersample than 2.35 — big CPU win with little visible loss at terminal res.
+        scale = max(scale, 2.0)
+
     sample_w = max(width, int(width * scale))
     sample_h = max(height, int(height * scale))
 
-    sampled = cv2.resize(gray, (sample_w, sample_h), interpolation=cv2.INTER_CUBIC)
-    sampled = cv2.resize(sampled, (width, height), interpolation=cv2.INTER_AREA)
+    gh, gw = gray.shape[0], gray.shape[1]
+    up = _UP if (sample_w > gw or sample_h > gh) else cv2.INTER_CUBIC
+    # Downscale to cell grid: INTER_LINEAR is much faster than INTER_AREA at 1k+ wide ultra grids.
+    down = cv2.INTER_LINEAR if (color_frame is not None and width * height >= 280_000) else cv2.INTER_AREA
+    sampled = cv2.resize(gray, (sample_w, sample_h), interpolation=up)
+    sampled = cv2.resize(sampled, (width, height), interpolation=down)
+    if color_frame is not None:
+        sampled = _gamma_u8(sampled, gamma=2.15)
+
+    # Per-pixel ANSI-256 colour path (Ultra mode) — same geometry as grayscale path
+    if color_frame is not None:
+        ch, cw = color_frame.shape[0], color_frame.shape[1]
+        cup = _UP if (sample_w > cw or sample_h > ch) else cv2.INTER_CUBIC
+        wcol = cv2.resize(color_frame, (sample_w, sample_h), interpolation=cup)
+        wcol = cv2.resize(wcol, (width, height), interpolation=down)
+        codes = _compute_color_codes(wcol)
+        return _render_rows(sampled, chars, None, codes)
+
     return _render_rows(sampled, chars, color_ramp)

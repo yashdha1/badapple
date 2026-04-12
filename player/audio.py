@@ -27,3 +27,21 @@ def extract_audio(video_path: str) -> str | None:
     if code == 0 and os.path.exists(path) and os.path.getsize(path) > 0:
         return path
     return None
+
+
+def get_audio_duration(audio_path: str) -> float:
+    """Return duration in seconds via ffprobe (fast, no decode)."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                audio_path,
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        return 0.0

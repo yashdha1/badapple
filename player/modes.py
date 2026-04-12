@@ -12,20 +12,22 @@ MODE_PRESETS: dict[str, dict[str, object]] = {
         "theme_idx": 0,
     },
     "high": {
-        "label": "High",
-        "charset_idx": 10,
-        "detail_idx": 2,
-        "auto_detail": True,
-        "colorized": True,
-        "theme_idx": 2,
-    },
-    "ultra": {
-        "label": "Ultra",
-        "charset_idx": 26,
-        "detail_idx": 3,
+        "label": "HighDef",
+        "charset_idx": 26,      # Braille Sweep — cinematic high quality
+        "detail_idx": 3,        # Hyper
         "auto_detail": True,
         "colorized": True,
         "theme_idx": 3,
+    },
+    "ultra": {
+        "label": "Ultra",
+        "charset_idx": 0,       # Detailed — 70+ characters, finest brightness mapping
+        "detail_idx": 3,        # Hyper
+        "auto_detail": True,
+        "colorized": True,      # per-pixel ANSI-256 color from original frame
+        "theme_idx": 3,
+        "fps_cap": 0.0,         # uncapped display; RLE + faster resize are the main limiters
+        "pixel_mode": True,     # triggers terminal resize + per-pixel color
     },
 }
 
