@@ -14,6 +14,19 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--add", metavar="URL", help="Download a video into videos/ using yt-dlp")
     parser.add_argument("-a",    metavar="URL", help="Download audio-only into audio_extracted/ using yt-dlp")
+    parser.add_argument(
+        "--seek-seconds",
+        type=float,
+        default=5.0,
+        metavar="SEC",
+        help="Seconds to skip with ←/→ (default: 5)",
+    )
+    parser.add_argument(
+        "--video-end",
+        choices=("next", "menu"),
+        default="next",
+        help="When a video ends: play next file in videos/ (sorted), or return to menu (default: next)",
+    )
     return parser.parse_args()
 
 
@@ -96,7 +109,18 @@ def main() -> None:
         if kind == "audio":
             theme_idx = play_audio(path, theme_idx)
         else:
-            theme_idx = play(path, theme_idx)
+            while True:
+                result = play(
+                    path,
+                    theme_idx,
+                    seek_seconds=args.seek_seconds,
+                    end_mode=args.video_end,
+                )
+                theme_idx = result.theme_idx
+                if result.next_video:
+                    path = result.next_video
+                    continue
+                break
 
 
 if __name__ == "__main__":

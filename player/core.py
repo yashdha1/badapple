@@ -6,6 +6,7 @@ import time
 import threading
 import math
 import random
+from typing import NamedTuple
 
 import cv2
 import pygame
@@ -16,7 +17,7 @@ from .console_win import ConsoleWindowLock
 from .input  import InputState, input_loop
 from .modes import MODE_PRESETS
 from .ui     import draw_hud, draw_loading, draw_video_only, theme_color_ramp, THEMES, \
-                    make_audio_art, draw_audio_hud
+                    make_audio_art, draw_audio_hud, next_video_in_library
 
 
 def _pack_playback_frame(
@@ -51,6 +52,11 @@ def _pack_playback_frame(
     )
 
 
+class PlayResult(NamedTuple):
+    theme_idx: int
+    next_video: str | None = None
+
+
 def _apply_mode_preset(state: InputState) -> None:
     preset = MODE_PRESETS.get(state.mode_name)
     if preset is None:
@@ -63,11 +69,17 @@ def _apply_mode_preset(state: InputState) -> None:
     state.theme_idx = int(preset["theme_idx"]) % state.theme_count
 
 
-def play(video_path: str, theme_idx: int = 0) -> int:
+def play(
+    video_path: str,
+    theme_idx: int = 0,
+    *,
+    seek_seconds: float = 5.0,
+    end_mode: str = "next",
+) -> PlayResult:
     if not os.path.exists(video_path):
         sys.stdout.write(f"\033[?25h\n  File not found: {video_path}\n")
         sys.stdout.flush()
-        return theme_idx
+        return PlayResult(theme_idx, None)
 
     title = os.path.basename(video_path)
 
@@ -84,6 +96,8 @@ def play(video_path: str, theme_idx: int = 0) -> int:
     total_f = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     vid_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     vid_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    duration_sec = (total_f / fps) if (fps > 0 and total_f > 0) else 0.0
+    ss = max(0.1, float(seek_seconds))
 
     # -- lock terminal size while playing to avoid resize distortion --
     try:
@@ -198,7 +212,7 @@ def play(video_path: str, theme_idx: int = 0) -> int:
     if not ret:
         cap.release()
         console_lock.release()
-        return state.theme_idx
+        return PlayResult(theme_idx, None)
     frame_num = 1
     _render(first_frame, frame_num)
     last_frame = first_frame
@@ -214,6 +228,8 @@ def play(video_path: str, theme_idx: int = 0) -> int:
     frame_fps_cap: float = 0.0
     last_render_t: float = 0.0
 
+    out_next: str | None = None
+
     # -- main playback loop --
     while cap.isOpened() and not state.quit:
         needs_refresh = state.redraw
@@ -226,6 +242,14 @@ def play(video_path: str, theme_idx: int = 0) -> int:
             frame_fps_cap = float(preset.get("fps_cap") or 0)
             if preset.get("pixel_mode"):
                 new_cols, new_rows = console_lock.fit_for_ultra(target_cols=ULTRA_MAX_WIDTH)
+                fixed_cols = max(new_cols, 40)
+                fixed_rows = max(new_rows, 20)
+            elif preset.get("hd_mode"):
+                new_cols, new_rows = console_lock.set_min_font_and_maximize(font_height=8)
+                fixed_cols = max(new_cols, 40)
+                fixed_rows = max(new_rows, 20)
+            elif preset.get("restore_mode"):
+                new_cols, new_rows = console_lock.restore_normal(font_height=16)
                 fixed_cols = max(new_cols, 40)
                 fixed_rows = max(new_rows, 20)
             last_render_t = 0.0
@@ -264,29 +288,74 @@ def play(video_path: str, theme_idx: int = 0) -> int:
                 if has_audio:
                     pygame.mixer.music.unpause()
 
+        did_seek = False
+        steps = state.seek_steps
+        if steps != 0:
+            state.seek_steps = 0
+            delta_sec = steps * ss
+            current_sec = min(last_frame_num / max(fps, 1e-9), duration_sec if duration_sec > 0 else 1e12)
+            new_sec = current_sec + delta_sec
+            if new_sec < 0:
+                new_sec = 0
+            if total_f > 0 and duration_sec > 0 and new_sec >= duration_sec - 1e-9:
+                out_next = next_video_in_library(video_path)
+                break
+            target_idx = int(new_sec * fps)
+            if total_f > 0:
+                target_idx = min(max(0, target_idx), total_f - 1)
+            else:
+                target_idx = max(0, target_idx)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
+            ret_s, f_seek = cap.read()
+            if not ret_s or f_seek is None:
+                out_next = next_video_in_library(video_path) if end_mode == "next" else None
+                break
+            frame_num = target_idx + 1
+            last_frame_num = frame_num
+            last_frame = f_seek
+            new_sec = target_idx / max(fps, 1e-9)
+            playback_start = time.perf_counter() - new_sec
+            if state.paused:
+                paused_at = time.perf_counter()
+            if has_audio:
+                pygame.mixer.music.stop()
+                pygame.mixer.music.play(0, float(new_sec))
+                if state.paused:
+                    pygame.mixer.music.pause()
+            needs_refresh = True
+            last_render_t = 0.0
+            did_seek = True
+
         if state.paused:
             if needs_refresh:
                 _render(last_frame, last_frame_num)
             time.sleep(0.02)
             continue
 
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame_num += 1
-
-        # drift catch-up: skip frames if we have fallen behind
-        elapsed  = time.perf_counter() - playback_start
-        expected = int(elapsed * fps) + 1
-        while frame_num < expected:
-            ret2, frame2 = cap.read()
-            if not ret2:
-                frame = None
+        if not did_seek:
+            ret, frame = cap.read()
+            if not ret:
+                if end_mode == "next":
+                    out_next = next_video_in_library(video_path)
                 break
-            frame = frame2
             frame_num += 1
-        if frame is None:
-            break
+
+            # drift catch-up: skip frames if we have fallen behind
+            elapsed  = time.perf_counter() - playback_start
+            expected = int(elapsed * fps) + 1
+            while frame_num < expected:
+                ret2, frame2 = cap.read()
+                if not ret2:
+                    frame = None
+                    break
+                frame = frame2
+                frame_num += 1
+            if frame is None:
+                if end_mode == "next":
+                    out_next = next_video_in_library(video_path)
+                break
+        else:
+            frame = last_frame
 
         now_r = time.perf_counter()
         should_draw = frame_fps_cap <= 0 or (now_r - last_render_t) >= 1.0 / frame_fps_cap
@@ -311,11 +380,15 @@ def play(video_path: str, theme_idx: int = 0) -> int:
     console_lock.release()
 
     os.system("cls")
-    sys.stdout.write("\033[?25h\n  Playback ended. Press any key to return to menu...\n")
-    sys.stdout.flush()
-    import msvcrt
-    msvcrt.getch()
-    return state.theme_idx
+    if out_next is None:
+        sys.stdout.write("\033[?25h\n  Playback ended. Press any key to return to menu...\n")
+        sys.stdout.flush()
+        import msvcrt
+        msvcrt.getch()
+    else:
+        sys.stdout.write("\033[?25h\n")
+        sys.stdout.flush()
+    return PlayResult(state.theme_idx, out_next)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

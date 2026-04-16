@@ -10,6 +10,7 @@ MODE_PRESETS: dict[str, dict[str, object]] = {
         "auto_detail": False,
         "colorized": False,
         "theme_idx": 0,
+        "restore_mode": True,   # restore terminal to pre-playback font/size
     },
     "high": {
         "label": "HighDef",
@@ -18,6 +19,7 @@ MODE_PRESETS: dict[str, dict[str, object]] = {
         "auto_detail": True,
         "colorized": True,
         "theme_idx": 3,
+        "hd_mode": True,        # triggers terminal maximize + font shrink to 8 px
     },
     "ultra": {
         "label": "Ultra",

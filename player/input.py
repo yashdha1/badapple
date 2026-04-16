@@ -11,6 +11,7 @@ from .modes import MODE_KEYS
 class InputState:
     paused:        bool = False
     quit:          bool = False
+    seek_steps:    int  = 0   # arrow ←/→: -N / +N (consumed by core; × seek_seconds)
     mode_name:     str = "custom"
     charset_idx:   int  = 0
     detail_idx:    int  = 0
@@ -35,13 +36,16 @@ def input_loop(state: InputState) -> None:
         if msvcrt.kbhit():
             ch = msvcrt.getch()
             if ch in (b"\xe0", b"\x00"):        # arrow / fn key prefix
-                msvcrt.getch()                  # discard the second byte
+                arrow = msvcrt.getch()
+                if arrow == b"K":               # ←
+                    state.seek_steps -= 1
+                elif arrow == b"M":             # →
+                    state.seek_steps += 1
             elif ch in (b" ", b"p", b"P"):
                 state.paused       = not state.paused
                 state.pause_toggle = True
             elif ch in (b"v", b"V"):
                 state.charset_idx = (state.charset_idx + 1) % state.charset_count
-                state.mode_name = "custom"
                 state.redraw = True
             elif ch in (b"m", b"M"):
                 state.detail_idx = (state.detail_idx + 1) % state.detail_count

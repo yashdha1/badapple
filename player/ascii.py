@@ -1,24 +1,37 @@
 """ASCII charset definitions, frame-to-ASCII conversion, and canvas math."""
 
+import os
 import cv2
 import numpy as np
 
 # Prefer Lanczos for upscales when available (OpenCV 4+).
 _UP = getattr(cv2, "INTER_LANCZOS4", cv2.INTER_CUBIC)
 
+# Pre-built ANSI-256 foreground escape sequences — avoids f-string formatting in the RLE hot loop.
+_ANSI_FG: list[str] = [f"\033[38;5;{i}m" for i in range(256)]
+
+# True-colour (24-bit) support: Windows Terminal sets COLORTERM=truecolor; also detect WT_SESSION.
+_TRUECOLOR: bool = (
+    os.environ.get("COLORTERM", "").lower() in ("truecolor", "24bit")
+    or bool(os.environ.get("WT_SESSION") or os.environ.get("WT_PROFILE_ID"))
+)
+
 # Upper bound for ultra horizontal resolution (terminal cols cap the real size).
 ULTRA_MAX_WIDTH: int = 1600
 
-CHARSETS: list[tuple[str, str]] = [
-    (" .'`^\",;Il!i><~+_-?][}{1)(|/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$", "Detailed"),
-    (" .,:;i1tfLCG08@",                                                          "Simple"),
-    (" -+*#@",                                                                   "Minimal"),
+CHARSETS: list[tuple[str, str]] = [ 
+    (" .'`^\",;Il!i><~+_-?][}{1)(|/MW&8%B$",    "Detailed"),
+    (".,:;i\|/BC0@",             "Simple"),
+    (" ⁘⁙⁚⁛⁜",                   "Dot Matrix Dense"),
+    (" /|\\|/|\\|",                  "Flow Grid"),     
+    (" .,:;i1tfLCGθ",                                                          "Simple"),
+    (" -+*#?",                                                                   "Minimal"),
     ("@%#*+=-:. ",                                                               "Inverse"),
     (" ░▒▓█",                                                                    "Block"),
-    (" .oO0#",                                                                   "Soft Dot"),
+    (" .oO0θ#",                                                                   "Soft Dot"),
     (" `.-:=+*#%@",                                                              "Gradient"),
-    (" .,:irsXA253hMHGS#9B&@",                                                   "Retro"),
-    (" _/|\\-=+*#%@",                                                            "Wire"),
+    (" .,:irsXA253hMHGS#9B&",                                                   "Retro"),
+    (" _/|\\-",                                                            "Wire"),
     # --- Density / Shading ---
     (" ·:;+=xX$&@",                                         "Punchy"),        # High contrast, snappy
     (" ░▒▓▓█▓▒░ ",                                          "Pulse"),         # Symmetric for breathing effects
@@ -45,6 +58,7 @@ CHARSETS: list[tuple[str, str]] = [
     (" ⡀⡄⡆⡇⣇⣧⣷⣿",                                         "Braille Sweep"), # Left-to-right sweep, very cinematic
     (" ▴▵△▲",                                               "Triangle"),     # For crystalline/geometric scenes
     (" ,;:<>[]|Il!1i",                                       "Thin Noise"),   # Dense, fine-grained noise/static
+
     # --- Corner & Edge Emphasis ---
     (" ┘┐┌└┼─│╴╵╶╷",                           "Corner Sharp"),   # Hard 90° corners, grid feel
     (" ╰╯╮╭│─",                                 "Corner Round"),   # Rounded corners, softer flow
@@ -77,8 +91,7 @@ CHARSETS: list[tuple[str, str]] = [
     (" ꩜ ꩝ 〇 ◌ ◍ ◎ ● ◉",                     "Ripple"),         # Expanding rings, sonar/water
     (" ╭─╮│ │╰─╯",                             "Bubble Box"),     # Rounded box outline pieces
     (" ⌁⌂⌃⌄⌅⌆",                               "Tech"),           # Technical symbol feel
-    (" ≀⋮⋯⋰⋱",                                 "Scatter"),        # Scattered asymmetric dots
-    (" ⠶⠦⠧⠷⠿⣿",                               "Braille Corner"), # Braille with corner-heavy patterns
+    (" ≀⋮⋯⋰⋱",                                 "Scatter"),        # Scattered asymmetric dots 
 ]
 
 DETAIL_LEVELS: list[dict[str, float | str]] = [
@@ -266,6 +279,60 @@ def _apply_profile(gray: np.ndarray, profile: dict[str, float | str]) -> np.ndar
     return enhanced
 
 
+def _render_rows_truecolor_rle(
+    sampled: np.ndarray,
+    chars: str,
+    color_bgr: np.ndarray,   # (H, W, 3) uint8 — OpenCV BGR order
+) -> str:
+    """
+    True-colour (24-bit) ultra path.  Groups adjacent pixels whose 4-bit-quantised
+    colour and glyph match into a single run, then outputs the actual RGB value for
+    the first pixel of each run.  This gives accurate colours (no ANSI-256 banding)
+    with a similar escape-sequence count to the ANSI-256 path.
+    """
+    n = len(chars) - 1
+    h, w = int(sampled.shape[0]), int(sampled.shape[1])
+    rows: list[str] = []
+    for row_idx in range(h):
+        line     = sampled[row_idx]
+        bgr_row  = color_bgr[row_idx]
+        ch_idx   = np.clip(line.astype(np.int32) * n // 255, 0, n).astype(np.uint32)
+
+        # 4-bit quantisation per channel (step 16) for span detection.
+        # Pixels whose R, G, B all differ by < 16 share a run; actual RGB is output.
+        rq = bgr_row[:, 2].astype(np.uint32) >> 4
+        gq = bgr_row[:, 1].astype(np.uint32) >> 4
+        bq = bgr_row[:, 0].astype(np.uint32) >> 4
+        color_key = (rq << 8) | (gq << 4) | bq        # 12-bit, 0-4095
+        keys = color_key * 256 + ch_idx
+
+        if w == 0:
+            rows.append("\033[0m")
+            continue
+        change = np.empty(w, dtype=bool)
+        change[0] = True
+        if w > 1:
+            change[1:] = keys[1:] != keys[:-1]
+        starts = np.flatnonzero(change)
+        ends   = np.r_[starts[1:], w]
+        parts: list[str] = []
+        active_key = -1
+        for si, ei in zip(starts, ends):
+            key = int(keys[si])
+            if key != active_key:
+                r_val = int(bgr_row[si, 2])
+                g_val = int(bgr_row[si, 1])
+                b_val = int(bgr_row[si, 0])
+                parts.append(f"\033[38;2;{r_val};{g_val};{b_val}m")
+                active_key = key
+            cch = chars[int(ch_idx[si])]
+            run = ei - si
+            parts.append(cch if run == 1 else cch * run)
+        parts.append("\033[0m")
+        rows.append("".join(parts))
+    return "\n".join(rows)
+
+
 def _render_rows_ultra_rle(
     sampled: np.ndarray,
     chars: str,
@@ -296,7 +363,7 @@ def _render_rows_ultra_rle(
             code = key // 256
             chi = min(key % 256, n)
             if code != active_code:
-                parts.append(f"\033[38;5;{code}m")
+                parts.append(_ANSI_FG[code])
                 active_code = code
             cch = chars[chi]
             run = ei - si
@@ -376,12 +443,13 @@ def frame_to_ascii(
     if color_frame is not None:
         sampled = _gamma_u8(sampled, gamma=2.15)
 
-    # Per-pixel ANSI-256 colour path (Ultra mode) — same geometry as grayscale path
+    # Per-pixel colour path (Ultra mode).
+    # Single-pass INTER_AREA downscale — faster and gives better averaging than
+    # the old two-pass supersample; ANSI-256 cube is too coarse to benefit from it.
     if color_frame is not None:
-        ch, cw = color_frame.shape[0], color_frame.shape[1]
-        cup = _UP if (sample_w > cw or sample_h > ch) else cv2.INTER_CUBIC
-        wcol = cv2.resize(color_frame, (sample_w, sample_h), interpolation=cup)
-        wcol = cv2.resize(wcol, (width, height), interpolation=down)
+        wcol = cv2.resize(color_frame, (width, height), interpolation=cv2.INTER_AREA)
+        if _TRUECOLOR:
+            return _render_rows_truecolor_rle(sampled, chars, wcol)
         codes = _compute_color_codes(wcol)
         return _render_rows(sampled, chars, None, codes)
 

@@ -161,6 +161,30 @@ def video_full_path(filename: str) -> str:
     return os.path.join(VIDEOS_DIR, filename)
 
 
+def next_video_in_library(video_path: str) -> str | None:
+    """
+    If *video_path* is a file directly under videos/ (same order as scan_videos),
+    return the absolute path of the next file in sorted order; otherwise None.
+    """
+    try:
+        abs_cur = os.path.normpath(os.path.abspath(video_path))
+        abs_dir = os.path.normpath(os.path.abspath(VIDEOS_DIR))
+    except OSError:
+        return None
+    if os.path.dirname(abs_cur) != abs_dir:
+        return None
+    files = scan_videos()
+    base = os.path.basename(abs_cur)
+    idx = None
+    for i, name in enumerate(files):
+        if name.lower() == base.lower():
+            idx = i
+            break
+    if idx is None or idx + 1 >= len(files):
+        return None
+    return os.path.normpath(video_full_path(files[idx + 1]))
+
+
 def scan_audio() -> list[str]:
     """Return sorted list of audio filenames inside audio_extracted/."""
     if not os.path.isdir(AUDIO_DIR):
@@ -333,6 +357,7 @@ def draw_hud(
 
     hints = (
         f"{theme['muted']}SPACE/P{RST} pause  "
+        f"{theme['muted']}←/→{RST} seek  "
         f"MODE {_mode_strip(mode_name, theme)}  "
         f"{theme['muted']}V{RST} charset  "
         f"{theme['muted']}M{RST} detail  "
@@ -344,7 +369,7 @@ def draw_hud(
         f"{theme['muted']}Q/ESC{RST} quit"
     )
     if len(_strip_ansi(hints)) > cols:
-        hints_one = f"{theme['muted']}SPACE/P pause  MODE 1·2·3  Q quit{RST}"
+        hints_one = f"{theme['muted']}SPACE/P pause  ←/→ seek  MODE 1·2·3  Q quit{RST}"
     else:
         hints_one = hints
 

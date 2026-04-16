@@ -1,8 +1,7 @@
-# ASCII Video Player
+# badapple
 
-Frames bloom into light,  
-Terminal hums in time,  
-Shadows learn to sing.
+video and audio player. 
+
 
 ## Run
 

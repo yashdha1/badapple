@@ -7,7 +7,9 @@ wheels/
 *.egg-info
 
 # Virtual environments
-.venv
+.venv/
 videos/
 cache/
 audio_extracted/
+/.claude
+/.codemie

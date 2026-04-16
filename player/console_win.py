@@ -183,15 +183,27 @@ class ConsoleWindowLock:
             pass
         return None
 
-    def _vt_resize_window_pixels(self, width_px: int, height_px: int) -> None:
-        """
-        XTerm-style: CSI 8 ; height ; width t — resize window in *pixels* (order matters).
-        Windows Terminal often honors this for the active pane.
-        """
+    def _vt_maximize(self) -> None:
+        """XTerm CSI 9;1t — maximize terminal window. Honored by Windows Terminal."""
         try:
-            h = max(120, int(height_px))
-            w = max(200, int(width_px))
-            sys.stdout.write(f"\033[8;{h};{w}t")
+            sys.stdout.write("\033[9;1t")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+    def _vt_restore(self) -> None:
+        """XTerm CSI 9;0t — restore terminal from maximized state."""
+        try:
+            sys.stdout.write("\033[9;0t")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+    def _vt_request_cols(self, cols: int, rows: int = 40) -> None:
+        """XTerm CSI 8 — request terminal resize to (rows x cols) text cells.
+        Windows Terminal honors this; conhost ignores it (Win32 path handles that)."""
+        try:
+            sys.stdout.write(f"\033[8;{max(10, rows)};{max(40, cols)}t")
             sys.stdout.flush()
         except Exception:
             pass
@@ -228,9 +240,7 @@ class ConsoleWindowLock:
 
         try:
             if not ref:
-                wp = self._primary_work_area_pixels()
-                if wp:
-                    self._vt_resize_window_pixels(wp[0], wp[1])
+                self._vt_maximize()
                 return
 
             hmon = self._user32.MonitorFromWindow(ref, MONITOR_DEFAULTTONEAREST)
@@ -270,8 +280,8 @@ class ConsoleWindowLock:
                 SWP_NOZORDER | SWP_SHOWWINDOW,
             )
 
-            # WT + pwsh: VT resize tracks the pane when Win32 targets the wrong HWND.
-            self._vt_resize_window_pixels(cx, cy)
+            # WT belt-and-suspenders: send VT maximize in case Win32 targeted the wrong HWND.
+            self._vt_maximize()
         except Exception:
             try:
                 if ref:
@@ -281,6 +291,9 @@ class ConsoleWindowLock:
 
     def set_min_font_and_maximize(self, font_height: int = 8) -> tuple[int, int]:
         """Shrink console font, maximize window, return new (cols, rows). Best-effort."""
+        # VT maximize fires immediately for Windows Terminal (font shrink via Win32 is a no-op there).
+        self._vt_maximize()
+
         if self._enabled and self._kernel32:
             try:
                 STD_OUTPUT_HANDLE = ctypes.c_ulong(0xFFFFFFF5)  # -11 as DWORD
@@ -323,6 +336,11 @@ class ConsoleWindowLock:
         columns even after maximize. We expand the screen buffer first so tiny fonts
         can actually increase the column count.
         """
+        # Fire VT maximize immediately — in Windows Terminal this is the primary path
+        # because SetCurrentConsoleFontEx is a no-op inside WT.
+        self._vt_maximize()
+        _time.sleep(0.2)
+
         # Windows conhost: buffer size from initial ``mode con`` limits the grid.
         # Expand before shrinking font / maximizing (values clamped by the OS).
         want_cols = max(220, min(target_cols + 80, 650))
@@ -339,6 +357,11 @@ class ConsoleWindowLock:
 
         # Second fill: font + buffer are set; one more work-area snap helps WT/conhost.
         self._fill_monitor_work_area()
+        _time.sleep(0.15)
+
+        # Ask WT (via CSI 8) for target_cols text columns.  WT honours this even when
+        # Win32 font tricks have no effect; conhost ignores it (already handled above).
+        self._vt_request_cols(target_cols, max(best[1], 30))
         _time.sleep(0.25)
 
         # Sync screen buffer to measured grid (and pick up any extra columns).
@@ -350,6 +373,60 @@ class ConsoleWindowLock:
             pass
 
         return best
+
+    def restore_normal(self, font_height: int = 16) -> tuple[int, int]:
+        """
+        Restore the console font to *font_height* px and revert the buffer size
+        to the dimensions saved at ``acquire()`` time.  Called when switching to
+        a low-intensity mode (e.g. Chill) from ultra/highdef.
+        """
+        # VT restore — Windows Terminal un-maximizes the pane/window.
+        self._vt_restore()
+        # VT char-resize back to original dimensions (WT path).
+        self._vt_request_cols(self._saved_cols, self._saved_rows)
+        _time.sleep(0.1)
+
+        # Win32 restore — conhost path.
+        if self._enabled:
+            host = self._host_hwnd_for_resize() or self._hwnd
+            if host:
+                try:
+                    self._user32.ShowWindow(host, self.SW_RESTORE)
+                except Exception:
+                    pass
+                _time.sleep(0.08)
+
+        # Restore font size
+        if self._enabled and self._kernel32:
+            try:
+                STD_OUTPUT_HANDLE = ctypes.c_ulong(0xFFFFFFF5)
+                self._kernel32.GetStdHandle.restype = ctypes.c_void_p
+                hout = self._kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+                fi = _CONSOLE_FONT_INFOEX()
+                fi.cbSize       = ctypes.sizeof(fi)
+                fi.nFont        = 0
+                fi.dwFontSize.X = 0
+                fi.dwFontSize.Y = font_height
+                fi.FontFamily   = 0x36
+                fi.FontWeight   = 400
+                fi.FaceName     = "Consolas"
+                self._kernel32.SetCurrentConsoleFontEx.restype = wintypes.BOOL
+                self._kernel32.SetCurrentConsoleFontEx(
+                    hout, ctypes.c_bool(False), ctypes.byref(fi)
+                )
+            except Exception:
+                pass
+
+        # Restore buffer / window to pre-playback dimensions
+        self._mode_con(self._saved_cols, self._saved_rows)
+        _time.sleep(0.15)
+
+        try:
+            sz = os.get_terminal_size()
+            self._sync_screen_buffer_chars(sz.columns, sz.lines)
+            return sz.columns, sz.lines
+        except OSError:
+            return self._saved_cols, self._saved_rows
 
     def release(self) -> None:
         """Restore prior resize behavior and the original console dimensions."""
